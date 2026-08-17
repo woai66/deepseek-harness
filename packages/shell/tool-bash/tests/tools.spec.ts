@@ -130,7 +130,7 @@ class RecordingSandboxExecutor extends ShellExecutor {
       stderr: { text: '', truncated: false },
       sandbox: {
         mode: spec.sandboxPolicy?.mode ?? 'read-only',
-        denied: false,
+        denied: spec.command === 'denied',
         ...spec.command === 'without optional sandbox facts'
           ? {}
           : { enforcement: 'full' as const, runnerFailed: false },
@@ -601,6 +601,35 @@ describe('sandbox escalation through the generic task producer', () => {
     }
   })
 
+  it.each([
+    ['danger-full-access', 'danger-full-access', undefined],
+    ['approval never', 'workspace-write', 'never'],
+  ] as const)('omits escalation fields and guidance for %s session assembly', async (_label, mode, approvalPolicy) => {
+    const { ctx } = await setupSandboxed(true)
+    const agent = sandboxAgent(mode)
+    if (approvalPolicy !== undefined) {
+      ;(agent.session.events as unknown as Array<{ type: string; data: { policy: string } }>).push({
+        type: 'approval/policy', data: { policy: approvalPolicy },
+      })
+    }
+    const schema = (await ctx.systemPrompt.assemble({ agent })).tools.find(tool => tool.name === 'bash')!
+    const properties = schema.parameters['properties'] as Record<string, unknown>
+    expect(properties).not.toHaveProperty('sandbox_permissions')
+    expect(properties).not.toHaveProperty('justification')
+    expect(schema.description).not.toContain('approval prompt')
+    expect(schema.description).not.toContain('sandbox_permissions')
+  })
+
+  it('keeps escalation fields for a workspace-write ask session assembly', async () => {
+    const { ctx } = await setupSandboxed(true)
+    const schema = (await ctx.systemPrompt.assemble({ agent: sandboxAgent('workspace-write') }))
+      .tools.find(tool => tool.name === 'bash')!
+    const properties = schema.parameters['properties'] as Record<string, unknown>
+    expect(properties).toHaveProperty('sandbox_permissions')
+    expect(properties).toHaveProperty('justification')
+    expect(schema.description).toContain('approval prompt')
+  })
+
   it('rejects injected escalation without a sandbox and non-widening escalation without prompting', async () => {
     const plain = await setup()
     expect(text(await call(plain, 'bash', escalate))).toContain('not available in this composition')
@@ -610,6 +639,14 @@ describe('sandbox escalation through the generic task producer', () => {
     ctx.on('approval/request', () => { prompted(); return Promise.resolve<ApprovalOutcome>('allowed-once') })
     const result = await call(ctx, 'bash', { ...escalate, sandbox_permissions: 'workspace-write' }, sandboxAgent('workspace-write'))
     expect(text(result)).toContain('not strictly wider')
+    expect(prompted).not.toHaveBeenCalled()
+
+    const fullAccess = await call(ctx, 'bash', {
+      ...escalate,
+      sandbox_permissions: 'workspace-write',
+      justification: ' ',
+    }, sandboxAgent('danger-full-access'))
+    expect(text(fullAccess)).toContain('already has danger-full-access; retry without sandbox_permissions')
     expect(prompted).not.toHaveBeenCalled()
 
     const malformed = sandboxAgent()
@@ -627,6 +664,32 @@ describe('sandbox escalation through the generic task producer', () => {
     const withService = await setupSandboxed(true)
     expect(text(await call(withService.ctx, 'bash', escalate))).toContain('no agent to route')
     expect(text(await call(withService.ctx, 'bash', escalate, sandboxAgent()))).toContain('no approval channel')
+  })
+
+  it('a forced escalation under approval never gives a retry instruction and does not run', async () => {
+    const { ctx, bash } = await setupSandboxed(true)
+    const agent = sandboxAgent('workspace-write')
+    ;(agent.session.events as unknown as Array<{ type: string; data: { policy: string } }>).push({
+      type: 'approval/policy', data: { policy: 'never' },
+    })
+    const result = await call(ctx, 'bash', {
+      ...escalate,
+      sandbox_permissions: 'danger-full-access',
+      justification: ' ',
+    }, agent)
+    expect(text(result)).toContain('disabled by this session approval policy; retry without sandbox_permissions and justification')
+    expect(bash.modes).toEqual([])
+  })
+
+  it('omits escalation guidance from a denial when approval is disabled', async () => {
+    const { ctx } = await setupSandboxed(true)
+    const agent = sandboxAgent('workspace-write')
+    ;(agent.session.events as unknown as Array<{ type: string; data: { policy: string } }>).push({
+      type: 'approval/policy', data: { policy: 'never' },
+    })
+    const result = await call(ctx, 'bash', { command: 'denied', description: 'trigger denial' }, agent)
+    expect(text(result)).toContain('[sandbox: file access denied under workspace-write mode]')
+    expect(text(result)).not.toContain('[sandbox: escalation available')
   })
 
   it.each([

@@ -21,8 +21,8 @@
 | `timeoutMs` | number | 超时覆盖值（毫秒）。执行器应用其配置的默认值与上限。 |
 | `workdir` | string | 本次调用的工作目录。默认取调用 agent（智能体）的会话 cwd（`session.header.cwd`），使每个会话在自己的工作区运行；相对 `workdir` 基于同一身份解析。 |
 | `run_in_background` | boolean | 立即返回 job id；不适用超时。 |
-| `sandbox_permissions` | string enum | 仅当已挂载 sandbox 执行器时才会公开（`ctx.shell.sandboxMode` 已定义）。用于对刚被 sandbox 拒绝的命令做一次性重试的更宽 sandbox 模式——取刚好足够的最窄更宽模式，要求 `justification` 并在执行**之前**经 `ctx.approval` 获得用户批准。未拓宽或无法获批的请求 fail-closed，不运行任何内容。 |
-| `justification` | string | 必须与 `sandbox_permissions` 一同提供：用一句话向用户解释为何正是这条命令需要更宽的访问。 |
+| `sandbox_permissions` | string enum | 仅在已挂载 sandbox 执行器、会话低于 `danger-full-access` 且有效审批策略为 `ask` 时按请求公开：被拒命令所需的更宽模式，来自封闭目标词表 `workspace-write`/`danger-full-access`。执行时校验严格拓宽。 |
+| `justification` | string | 必须与 `sandbox_permissions` 一同提供（缺少任一项都是校验错误）：用一句话向用户解释为何正是这条命令需要更宽的访问。 |
 
 `command`、`workdir` 与 `timeoutMs` 在执行前经 `ctx.shell.resolve()` 按执行器配置默认值解析。workdir 默认值在工具层于 `resolve()` 之前从调用 agent 的 `session.header.cwd` 取得——每次会话的 cwd 必须来自 `exec.agent`，因为 N 个会话共享一个执行器；仅当没有会话 cwd 时执行器才回退到自己的配置 / `process.cwd()`。
 
@@ -30,15 +30,19 @@
 
 每次前台与后台模型 pwsh 调用都会通过共享的 [`dsh-shell-env`](../shell-env/) 注册表收到一份新收集的受信任 `DSH_*` 环境：`DSH_HOME`（Harness 主目录绝对路径）、`DSH_SHELL=1`、agent 的 `DSH_SESSION_ID`，以及活跃持久化后端定位到 JSONL 时的 `DSH_SESSION_JSONL`。向 `ctx.shellEnv` 贡献 `DSH_*` 事实的插件对 pwsh 调用与 bash 调用一视同仁。快照通过专用的 `ShellExecRequest.dshEnv` 通道传递；`process.env` 永不被修改。描述只教授通用的 `$env:DSH_*` 约定，而不是点名持久化相关的变量。
 
-结果文本包含 stdout、可选的 `[stderr]` 段，然后是适用的截断、sandbox 拒绝（组合公开升级能力时带同轮次升级提示）、超时、signal 与退出 marker。干净退出（0、无 signal）不产生 marker；空体渲染为 `(no output)`。截断会链接一个安全的完整 spill 文件，或报告其不可用。超时独立于最终退出状态报告；非零退出仍是模型解读的结果而非 `isError`。Windows 上强制终止以无 signal 的 exit 1 结算，因此 `[killed by signal: …]` 仅适用于 POSIX。只有基础设施失败——spawn 错误与中止（`tool call aborted`）——产生 `isError`。
+结果文本包含 stdout、可选的 `[stderr]` 段，然后是适用的截断、sandbox 拒绝、超时、signal 与退出 marker。仅当调用会话可请求更宽模式时，拒绝结果才包含同轮次升级提示。干净退出（0、无 signal）不产生 marker；空体渲染为 `(no output)`。截断会链接一个安全的完整 spill 文件，或报告其不可用。超时独立于最终退出状态报告；非零退出仍是模型解读的结果而非 `isError`。Windows 上强制终止以无 signal 的 exit 1 结算，因此 `[killed by signal: …]` 仅适用于 POSIX。只有基础设施失败——spawn 错误与中止（`tool call aborted`）——产生 `isError`。
 
-规范成功形态是已完成前台进程的 `{ kind: 'foreground', ...ShellRunResult }`（存在时投影执行器的 `sandbox` 事实——`mode`/`denied`、可选的 `enforcement`/`runnerFailed`）或已发布任务的 `{ kind: 'background', jobId }`。渲染器对后台 ack 精确保留 `started background job <id>`；编程消费者使用类型化字段而不解析渲染文本。
+规范成功形态是已完成前台进程的 `{ kind: 'foreground', ...ShellRunResult }`（存在时投影执行器的 `sandbox` 事实——`mode`/`denied`、可选的 `enforcement`/`runnerFailed`）或已发布任务的 `{ kind: 'background', jobId }`。前台 sandbox 投影还携带 `escalationAvailable`，作为纯结果渲染器使用的调用时事实。渲染器对后台 ack 精确保留 `started background job <id>`；编程消费者使用类型化字段而不解析渲染文本。
 
 当 `run_in_background` 为 true 时，本插件在 spawn 前预检 `ctx.jobs.start()`，把调用 agent 注册为 owner，并将返回的 `ShellProcess` 句柄适配为通用的 cancel/done/增量输出钩子。任务运行时负责 job id、跨会话隔离、完成通知、等待和 dispose（资源释放）清理；本插件只把 pwsh 退出事实映射进任务输出与结果明细。`enableRunInBackground: false` 会移除参数并在执行时拒绝强制的后台调用。
 
 ## UI presentation
 
 工具拥有自己的 `presentCall`/`presentResult` 呈现意图。前台调用是携带命令、描述与可选 cwd 的 `terminal` 卡；`run_in_background` 调用是携带原始命令的 `generic` 卡，镜像 bash 工具的后台呈现。完成的前台结果同样是 `terminal` 卡：退出 marker 变成卡片的退出状态 pill（`exitCode`/`signal`），去 marker 的正文成为卡片输出——与 bash 工具的 terminal 卡故事完全一致，经由 `@deepseek-ai/dsh-shell` 的共享退出状态解析。后台 ack 与执行错误保持 `generic` 卡，以 `console` 围栏包裹渲染输出。这些 presenter 是纯函数且可重放。
+
+## 权限与升级
+
+升级的 pwsh 调用在执行前解析 `ctx.approval`。`allowed-once` 只为该调用应用请求模式；拒绝、取消、不可用或缺少审批上下文时不会执行任何内容，并返回不同错误。发生真实拒绝后，模型可在同一轮次用刚好足够的最窄模式与 justification 重试同一命令。处于 `never` 或已经是 `danger-full-access` 的会话会省略升级字段和重试指引；注入这些字段的请求会在执行前失败，并指示移除字段后重试。升级不得凭空猜测，已禁用或被拒的审批是最终结果。更广泛的依据由 [sandbox Agent Note](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) 说明。
 
 ## 模型体验
 
@@ -60,27 +64,27 @@ Non-zero exits are reported as `[exit code: N]` markers; investigate failures be
 
 #### KV Cache 影响
 
-注册作用域与 prompt 文本不变时前缀稳定。插件激活或释放可能使该 prompt 段落的复用失效。
+注册作用域与 prompt 文本不变时前缀稳定。插件激活或释放可能使该 prompt 段落的复用失效；sandbox 模式切换不会。
 
 ### 工具 schema
 
 #### 模型看到的内容
 
-模型看到生成的 [`pwsh` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-pwsh)。按 agent 作用域的工具限制可以移除该 agent 的定义。
+模型看到生成的 [`pwsh` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-pwsh)。仅当本 producer 启用时才出现 `run_in_background`。仅当已挂载的执行器提供 sandbox，且当前会话可以请求更宽模式时，才出现 `sandbox_permissions`、`justification` 及其指引。按 agent 作用域的工具限制可以移除该 agent 的定义。
 
 #### Token 影响
 
-工具可见的每个请求上的固定 schema 成本。
+工具可见的每个请求上的固定 schema 成本；可用升级会增加两个字段及其条件描述段落。
 
 #### KV Cache 影响
 
-可见性与工具定义不变时前缀稳定。限制或配置变更可能从首个变化 token 起使复用失效。
+可见性、后台支持、执行器 sandbox 能力与有效会话权限状态不变时前缀稳定。限制、配置或执行器变更，以及增加或移除升级的权限切换，可能从首个变化的工具定义起使复用失效。
 
 ### 前台结果
 
 #### 模型看到的内容
 
-渲染器输出数据相关的 stdout 尾部，然后是可选的 `[stderr]` 与 stderr 尾部。条件行精确为 `[output truncated; full output: <path>]`、`[sandbox: file access denied under <mode> mode]` 加升级提示 `[sandbox: escalation available — …]`（仅当组合公开升级能力时）、`[timed out after <timeoutMs>ms]`、`[killed by signal: <signal>]` 与 `[exit code: <exitCode>]`（仅非零退出）；空体渲染为 `(no output)`。
+渲染器输出数据相关的 stdout 尾部，然后是可选的 `[stderr]` 与 stderr 尾部。条件行精确为 `[output truncated; full output: <path>]`、`[sandbox: file access denied under <mode> mode]`、`[timed out after <timeoutMs>ms]`、`[killed by signal: <signal>]` 与 `[exit code: <exitCode>]`（仅非零退出）；空体渲染为 `(no output)`。仅当调用会话可以请求更宽模式时，才出现 sandbox 升级行。
 
 #### Token 影响
 
@@ -108,7 +112,7 @@ ack 是固定短行；任务输出按读取有界。
 
 #### 模型看到的内容
 
-校验与基础设施失败规范化为 `Error: <message>`。本包的稳定消息包括 `invalid command: expected a non-empty string`、`invalid description: expected a non-empty string`、`invalid timeoutMs: expected a positive number, got <value>`、`invalid escalation: sandbox_permissions requires a justification`、`invalid escalation: justification is only valid together with sandbox_permissions`、`invalid justification: expected a non-empty sentence`、`sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`、共享的升级失败（非严格更宽、无审批服务、无 agent 可路由、无审批通道、用户拒绝、已取消）、`run_in_background is disabled for this deployment (enableRunInBackground: false)`、`background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs` 与 `tool call aborted`。
+校验与基础设施失败规范化为 `Error: <message>`。本包的稳定消息包括 `invalid command: expected a non-empty string`、`invalid description: expected a non-empty string`、`invalid timeoutMs: expected a positive number, got <value>`、`invalid escalation: sandbox_permissions requires a justification`、`invalid escalation: justification is only valid together with sandbox_permissions`、`invalid justification: expected a non-empty sentence`、`sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`、`sandbox escalation is disabled by this session approval policy; retry without sandbox_permissions and justification`、`sandbox escalation is unavailable because this call already has danger-full-access; retry without sandbox_permissions and justification`、共享的升级失败（非严格更宽、无审批服务、无 agent 可路由、无审批通道、用户拒绝、已取消）、`run_in_background is disabled for this deployment (enableRunInBackground: false)`、`background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs` 与 `tool call aborted`。
 
 #### Token 影响
 

@@ -51,7 +51,7 @@ await ctx.plugin(ToolFs)                                  // this package — re
 
 工具在每次分派中把 `exec`（工具执行上下文）作为不透明 `actor` 传入。默认 thunk 返回 `undefined`（不受约束的裸提供方）。加载 `@deepseek-ai/dsh-fs-observation-policy` 后，它会占用单个决策槽：返回 `createIfAbsent`/`replaceIfVersion`/`{ version }` 或抛出 `FS_NOT_OBSERVED`，并在 `fs/observed` 时记录。后端错误（`FsError`）和抛出的 `FS_NOT_OBSERVED` 会流经 `ToolRuntime.execute()`，变成 `isError` 工具结果，并附带 `{ name, code }`。
 
-当 `ctx.fs.sandboxMode` 表明提供方施加沙箱限制时，write/edit 会公开 `sandbox_permissions` 与 `justification`，并通过 `ctx.approval` 处理获批后的重试。策略归属方会贡献与具体能力无关的常驻策略；工具结果仍保留针对具体操作的拒绝与重试引导。
+当 `ctx.fs.sandboxMode` 表明提供方施加沙箱限制时，write/edit 会通过 `ctx.approval` 处理获批后的重试。仅当当前会话低于 `danger-full-access` 且其有效审批策略为 `ask` 时，`sandbox_permissions`、`justification`、描述引导和拒绝结果的重试提示才会出现。策略归属方会贡献与具体能力无关的常驻策略；在 `never` 或 full access 下注入的升权请求会在变更前失败，并指示去掉这些字段重试。
 
 ## `fs/observed` 发后即忘
 
@@ -99,7 +99,7 @@ Use the edit tool for targeted changes to existing UTF-8 text files. It replaces
 
 #### 模型看到的内容
 
-模型会看到已生成的 [`read`、`read_image`、`write` 和 `edit` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-fs)，参数使用 snake_case。`read_image` 只在持久附件存储已挂载时出现；schema 本身与路由无关，严格门禁在执行时拒绝。作用域工具限制可以为某个 agent 移除任一定义。
+模型会看到已生成的 [`read`、`read_image`、`write` 和 `edit` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-fs)，参数使用 snake_case。`read_image` 只在持久附件存储已挂载时出现；schema 本身与路由无关，严格门禁在执行时拒绝。`write` 和 `edit` 仅在当前会话能请求更宽沙箱模式时包含升权字段。作用域工具限制可以为某个 agent 移除任一定义。
 
 #### Token 影响
 
@@ -107,7 +107,7 @@ Use the edit tool for targeted changes to existing UTF-8 text files. It replaces
 
 #### KV Cache 影响
 
-只要可见工具定义和顺序不变，前缀就保持稳定。注册生命周期或作用域限制可能从首个变化的 schema token 开始使复用失效。
+只要可见工具定义、顺序和会话有效权限状态不变，前缀就保持稳定。注册生命周期、作用域限制或会添加／移除升权的权限切换，可能从首个变化的 schema token 开始使复用失效。
 
 ### 读取结果
 
@@ -155,7 +155,7 @@ Use the edit tool for targeted changes to existing UTF-8 text files. It replaces
 
 #### 模型看到的内容
 
-失败会规范化为 `Error: <message>`。本包稳定的校验和读取消息是 `file_path must be a non-empty string`、`limit must be less than or equal to <max>`、`old_string must be a non-empty string`、`old_string and new_string must differ`、`cannot read "<path>": not found`、`cannot read "<path>": not a regular file`、`offset <offset> is out of range for "<path>" (<total> lines)`、`cannot read "<path>": read_image only accepts PNG/JPEG/WebP/GIF paths`、`cannot read "<path>" as an image: model "<model>" does not declare image input; switch to an image-capable model to read images`，以及类型不匹配的修复消息 `cannot read "<path>": the <ext> extension declares <type>, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`；提供方和策略模板在各自包的 README 中逐字列出。防护变更失败还会在消息中携带恢复指令，由本包面向模型的错误包装追加：`FS_STALE_VERSION` 追加 `— re-read the file, then retry`，`FS_NOT_OBSERVED` 追加 `— read the file, then retry`；结构化错误码保持不变。该次重新读取确认缺失后，edit 会报告 `FS_NOT_FOUND`，而不会重复陈旧恢复指令；write 则使用带防护的创建。
+失败会规范化为 `Error: <message>`。本包稳定的校验和读取消息是 `file_path must be a non-empty string`、`limit must be less than or equal to <max>`、`old_string must be a non-empty string`、`old_string and new_string must differ`、`cannot read "<path>": not found`、`cannot read "<path>": not a regular file`、`offset <offset> is out of range for "<path>" (<total> lines)`、`cannot read "<path>": read_image only accepts PNG/JPEG/WebP/GIF paths`、`cannot read "<path>" as an image: model "<model>" does not declare image input; switch to an image-capable model to read images`，以及类型不匹配的修复消息 `cannot read "<path>": the <ext> extension declares <type>, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`；提供方和策略模板在各自包的 README 中逐字列出。不可用的升权会报告 `sandbox escalation is disabled by this session approval policy; retry without sandbox_permissions and justification` 或 `sandbox escalation is unavailable because this call already has danger-full-access; retry without sandbox_permissions and justification`。防护变更失败还会在消息中携带恢复指令，由本包面向模型的错误包装追加：`FS_STALE_VERSION` 追加 `— re-read the file, then retry`，`FS_NOT_OBSERVED` 追加 `— read the file, then retry`；结构化错误码保持不变。该次重新读取确认缺失后，edit 会报告 `FS_NOT_FOUND`，而不会重复陈旧恢复指令；write 则使用带防护的创建。
 
 #### Token 影响
 

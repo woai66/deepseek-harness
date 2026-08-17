@@ -1,6 +1,6 @@
 /**
  * Tests for the shared escalation vocabulary and choreography: the strictly-
- * wider ladder, the argument-pairing validation, the model-facing markers, and
+ * wider ladder, argument-pairing validation, model-facing markers, and
  * {@link approveEscalation}'s ordered fail-closed sequence. Both enforcing tool
  * families (`dsh-tool-bash`, `dsh-tool-fs`) delegate here, so the ordering and
  * verbatim texts are pinned once, next to the vocabulary that owns them.
@@ -81,12 +81,22 @@ describe('approveEscalation', () => {
     expect(seen[0]?.reason).toBe('escalate sandbox to workspace-write: the user asked to write in the workspace')
   })
 
-  it('a non-widening request fails closed with its own text and never asks', async () => {
+  it('full access reports that escalation is unavailable and never asks', async () => {
+    const seen: unknown[] = []
+    const spy = ingredients({ approver: approver('allowed-once', r => seen.push(r)) })
+    for (const requestedMode of ['workspace-write', 'danger-full-access']) {
+      await expect(approveEscalation(req({ requestedMode, effectiveMode: 'danger-full-access' }), spy))
+        .rejects.toThrow('already has danger-full-access; retry without sandbox_permissions and justification')
+    }
+    expect(seen).toEqual([])
+  })
+
+  it('other non-widening targets fail without asking', async () => {
     const seen: unknown[] = []
     const spy = ingredients({ approver: approver('allowed-once', r => seen.push(r)) })
     await expect(approveEscalation(req({ requestedMode: 'read-only' }), spy))
       .rejects.toThrow(/not strictly wider than this call's current "read-only" mode/)
-    await expect(approveEscalation(req({ requestedMode: 'workspace-write', effectiveMode: 'danger-full-access' as never }), spy))
+    await expect(approveEscalation(req({ requestedMode: 'workspace-write', effectiveMode: 'workspace-write' }), spy))
       .rejects.toThrow(/not strictly wider/)
     expect(seen).toEqual([])
   })

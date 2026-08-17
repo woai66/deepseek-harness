@@ -21,8 +21,8 @@ The plugin also contributes the `tool:pwsh` prompt section (order 105): non-zero
 | `timeoutMs` | number | Timeout override in milliseconds. The executor applies its configured default and cap. |
 | `workdir` | string | Working directory for this call. Defaults to the calling agent's session cwd (`session.header.cwd`) so each session runs in its own workspace; a relative `workdir` is resolved against that same identity. |
 | `run_in_background` | boolean | Return a job id immediately; no timeout applies. |
-| `sandbox_permissions` | string enum | Advertised only when a sandboxing executor is mounted (`ctx.shell.sandboxMode` defined). The wider sandbox mode for a one-shot retry of a command the sandbox just denied — the narrowest wider mode that suffices, requiring `justification` and user approval through `ctx.approval` BEFORE execution. A non-widening or unapprovable request fails closed without running anything. |
-| `justification` | string | Required with `sandbox_permissions`: one sentence for the user explaining why this exact command needs the wider access. |
+| `sandbox_permissions` | string enum | Advertised per request only when the mounted executor sandboxes, the session is below `danger-full-access`, and its effective approval policy is `ask`: the wider mode a denied command needs, from the closed target vocabulary `workspace-write`/`danger-full-access`. Strict widening is checked at execution. |
+| `justification` | string | Required together with `sandbox_permissions` (each without the other is a validation error): one sentence for the user explaining why this exact command needs the wider access. |
 
 `command`, `workdir`, and `timeoutMs` are resolved against the executor's config defaults via `ctx.shell.resolve()` before execution. The workdir default is applied in the tool layer from the calling agent's `session.header.cwd` BEFORE `resolve()` — the per-session cwd must come from `exec.agent`, since N sessions share one executor; only when no session cwd is available does the executor fall back to its own config / `process.cwd()`.
 
@@ -30,15 +30,19 @@ The plugin also contributes the `tool:pwsh` prompt section (order 105): non-zero
 
 Every foreground and background model pwsh call receives a freshly collected trusted `DSH_*` environment through the shared [`dsh-shell-env`](../shell-env/) registry: `DSH_HOME` (the absolute Harness home), `DSH_SHELL=1`, the agent's `DSH_SESSION_ID`, and `DSH_SESSION_JSONL` when the active persistence backend locates one. Plugins contributing `DSH_*` facts to `ctx.shellEnv` apply to pwsh calls exactly as they do to bash calls. The snapshot passes through the dedicated `ShellExecRequest.dshEnv` channel; `process.env` is never modified. The description teaches the generic `$env:DSH_*` convention rather than naming persistence-specific variables.
 
-Result text contains stdout, an optional `[stderr]` section, then applicable truncation, sandbox-denial (with the same-turn escalation hint when the composition advertises escalation), timeout, signal, and exit markers. A clean exit (0, no signal) produces no marker; an empty body renders as `(no output)`. Truncation links a safe complete spill file or reports it unavailable. Timeout is reported independently of final exit status; nonzero exit remains a model-interpreted result rather than `isError`. Windows reports forced termination as exit 1 without a signal, so `[killed by signal: …]` is POSIX-only there. Only infrastructure failures — spawn errors and aborts (`tool call aborted`) — produce `isError`.
+Result text contains stdout, an optional `[stderr]` section, then applicable truncation, sandbox-denial, timeout, signal, and exit markers. A denial includes the same-turn escalation hint only when the calling session can ask for a wider mode. A clean exit (0, no signal) produces no marker; an empty body renders as `(no output)`. Truncation links a safe complete spill file or reports it unavailable. Timeout is reported independently of final exit status; nonzero exit remains a model-interpreted result rather than `isError`. Windows reports forced termination as exit 1 without a signal, so `[killed by signal: …]` is POSIX-only there. Only infrastructure failures — spawn errors and aborts (`tool call aborted`) — produce `isError`.
 
-The canonical success is `{ kind: 'foreground', ...ShellRunResult }` for a completed foreground process (with the executor's `sandbox` facts — `mode`/`denied`, optional `enforcement`/`runnerFailed` — projected when present) or `{ kind: 'background', jobId }` for a published task. The renderer preserves exactly `started background job <id>` for background acks; programmatic consumers use the typed fields without parsing the rendered text.
+The canonical success is `{ kind: 'foreground', ...ShellRunResult }` for a completed foreground process (with the executor's `sandbox` facts — `mode`/`denied`, optional `enforcement`/`runnerFailed` — projected when present) or `{ kind: 'background', jobId }` for a published task. A foreground sandbox projection also carries `escalationAvailable`, the call-time fact used by the pure result renderer. The renderer preserves exactly `started background job <id>` for background acks; programmatic consumers use the typed fields without parsing the rendered text.
 
 When `run_in_background` is true, this plugin preflights `ctx.jobs.start()` before spawning, registers the calling agent as owner, and adapts the returned `ShellProcess` handle into generic cancel/done/incremental-output hooks. The job runtime owns ids, cross-session isolation, completion notices, waiting, and disposal cleanup; this plugin only maps pwsh exit facts into job output and outcome detail. `enableRunInBackground: false` removes the parameter and rejects a forced background call at execution time.
 
 ## UI presentation
 
 The tool owns its `presentCall`/`presentResult` render intent. A foreground call is a `terminal` card carrying command, description, and optional cwd; a `run_in_background` call is a `generic` card with the raw command, mirroring the bash tool's background presentation. A completed foreground result is a `terminal` card too: the exit marker becomes the card's exit-status pill (`exitCode`/`signal`), and the marker-free body is the card's output — exactly the bash tool's terminal-card story, via the shared exit-status parse from `@deepseek-ai/dsh-shell`. Background acks and execution errors stay `generic` cards with the rendered output in a `console` fence. These presenters are pure and replay-safe.
+
+## Permissions and escalation
+
+Escalating pwsh calls resolve `ctx.approval` before execution. `allowed-once` applies the requested mode only to that call; rejection, cancellation, unavailability, or missing approval context executes nothing and returns a distinct error. On a real denial, the model may retry the same command once in the same turn with the narrowest sufficient mode and justification. A session under `never` or already at `danger-full-access` omits the escalation fields and retry guidance, and an injected request fails before execution with an instruction to retry without them. Escalation is never speculative, and a disabled or rejected approval is final. The [sandbox Agent Note](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) owns the broader rationale.
 
 ## Model Experience
 
@@ -60,27 +64,27 @@ Small fixed input cost per request while the plugin is active.
 
 #### KV Cache effect
 
-Prefix-stable while the registration scope and prompt text are unchanged. Plugin activation or disposal may invalidate reuse from this prompt section.
+Prefix-stable while the registration scope and prompt text are unchanged. Plugin activation or disposal may invalidate reuse from this prompt section; sandbox mode switches do not.
 
 ### Tool schemas
 
 #### What the model sees
 
-The model sees the generated [`pwsh` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-pwsh). Agent-scoped tool restrictions can remove the definition for that agent.
+The model sees the generated [`pwsh` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-pwsh). `run_in_background` appears only when this producer enables it. `sandbox_permissions`, `justification`, and their guidance appear only when the mounted executor sandboxes and the current session can ask for a wider mode. Agent-scoped tool restrictions can remove the definition for that agent.
 
 #### Token effect
 
-Fixed schema cost on every request where the tool is visible.
+Fixed schema cost on every request where the tool is visible; an available escalation adds the two fields and its conditional description paragraph.
 
 #### KV Cache effect
 
-Prefix-stable while visibility and the tool definition are unchanged. A restriction or config change may invalidate reuse from the first changed token.
+Prefix-stable while visibility, background support, executor sandbox capabilities, and effective session permission state are unchanged. A restriction, config change, executor change, or permission switch that adds or removes escalation may invalidate reuse from the first changed tool definition.
 
 ### Foreground result
 
 #### What the model sees
 
-The renderer emits the data-dependent stdout tail, then optional `[stderr]` and the stderr tail. Conditional lines are exactly `[output truncated; full output: <path>]`, `[sandbox: file access denied under <mode> mode]` plus the escalation hint `[sandbox: escalation available — …]` (only when the composition advertises escalation), `[timed out after <timeoutMs>ms]`, `[killed by signal: <signal>]`, and `[exit code: <exitCode>]` (nonzero exits only); an empty body renders as `(no output)`.
+The renderer emits the data-dependent stdout tail, then optional `[stderr]` and the stderr tail. Conditional lines are exactly `[output truncated; full output: <path>]`, `[sandbox: file access denied under <mode> mode]`, `[timed out after <timeoutMs>ms]`, `[killed by signal: <signal>]`, and `[exit code: <exitCode>]` (nonzero exits only); an empty body renders as `(no output)`. The sandbox escalation line appears only when the calling session can ask for a wider mode.
 
 #### Token effect
 
@@ -108,7 +112,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-Validation and infrastructure failures are normalized as `Error: <message>`. This package's stable messages are `invalid command: expected a non-empty string`, `invalid description: expected a non-empty string`, `invalid timeoutMs: expected a positive number, got <value>`, `invalid escalation: sandbox_permissions requires a justification`, `invalid escalation: justification is only valid together with sandbox_permissions`, `invalid justification: expected a non-empty sentence`, `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`, the shared escalation failures (not strictly wider / no approval service / no agent to route / no approval channel / user rejected / was cancelled), `run_in_background is disabled for this deployment (enableRunInBackground: false)`, `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, and `tool call aborted`.
+Validation and infrastructure failures are normalized as `Error: <message>`. This package's stable messages are `invalid command: expected a non-empty string`, `invalid description: expected a non-empty string`, `invalid timeoutMs: expected a positive number, got <value>`, `invalid escalation: sandbox_permissions requires a justification`, `invalid escalation: justification is only valid together with sandbox_permissions`, `invalid justification: expected a non-empty sentence`, `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`, `sandbox escalation is disabled by this session approval policy; retry without sandbox_permissions and justification`, `sandbox escalation is unavailable because this call already has danger-full-access; retry without sandbox_permissions and justification`, the shared escalation failures (not strictly wider / no approval service / no agent to route / no approval channel / user rejected / was cancelled), `run_in_background is disabled for this deployment (enableRunInBackground: false)`, `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, and `tool call aborted`.
 
 #### Token effect
 
