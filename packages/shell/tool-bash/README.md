@@ -21,7 +21,7 @@ The plugin also contributes the `tool:bash` prompt section (order 105): check th
 | `timeoutMs` | number | Timeout override in milliseconds. The executor applies its configured default and cap. |
 | `workdir` | string | Working directory for this call. Defaults to the filesystem identity of the calling agent's session cwd (`session.header.cwd`) so each session runs in its own workspace; a relative `workdir` is resolved against that same identity. |
 | `run_in_background` | boolean | Return a job id immediately; no timeout applies. |
-| `sandbox_permissions` | string enum | ADVERTISED ONLY when the mounted executor sandboxes (`ctx.shell.sandboxMode` reports a confining default): the wider mode a denied command needs, from the closed target vocabulary `workspace-write`/`danger-full-access` (never cut down to the executor's default — the effective mode is per-session; strict widening is checked at execution against it, and a non-widening request fails without prompting anyone). |
+| `sandbox_permissions` | string enum | Advertised per request only when the mounted executor sandboxes, the session is below `danger-full-access`, and its effective approval policy is `ask`: the wider mode a denied command needs, from the closed target vocabulary `workspace-write`/`danger-full-access`. Strict widening is checked at execution. |
 | `justification` | string | Required together with `sandbox_permissions` (each without the other is a validation error): one sentence for the user explaining why this exact command needs the wider access. |
 
 `command`, `workdir`, and `timeoutMs` are resolved against the executor's config defaults via `ctx.shell.resolve()` before execution, so the Service Definition (`ShellExecSpec`) receives explicit `workdir`/`timeoutMs` values. The workdir default is applied in the tool layer from the calling agent's `session.header.cwd` BEFORE `resolve()` — the per-session cwd must come from `exec.agent`, since N sessions share one executor; only when no session cwd is available does the executor fall back to its own config / `process.cwd()`. When sandbox policy is present, the tool reuses its already-canonical `workspaceRoot` as the workdir base so confinement and process launch cannot resolve the same session spelling differently.
@@ -32,7 +32,7 @@ Every foreground and background model bash call receives a freshly collected tru
 
 Result text contains stdout, an optional `[stderr]` section, then applicable sandbox-denial, timeout, signal, exit-code, and truncation markers. Timeout is reported independently of final exit status; nonzero exit remains a model-interpreted result rather than `isError`. Truncation links a safe complete spill file or reports it unavailable. Only infrastructure failures such as spawn errors and aborts produce `isError`.
 
-The canonical success is `{ kind: 'foreground', ...ShellRunResult }` for a completed foreground process or `{ kind: 'background', jobId }` for a published task. The Native renderer preserves the text above, including exactly `started background job <id>`; programmatic consumers use the typed fields without parsing those strings. Executor stream caps remain acquisition limits on `ShellRunResult` and carry their spill paths.
+The canonical success is `{ kind: 'foreground', ...ShellRunResult }` for a completed foreground process or `{ kind: 'background', jobId }` for a published task. A foreground sandbox projection also carries `escalationAvailable`, the call-time fact used by the pure result renderer. The Native renderer preserves the text above, including exactly `started background job <id>`; programmatic consumers use the typed fields without parsing those strings. Executor stream caps remain acquisition limits on `ShellRunResult` and carry their spill paths.
 
 When `run_in_background` is true, this plugin preflights `ctx.jobs.start()` before spawning, registers the calling agent as owner, and adapts the returned `ShellProcess` handle into generic cancel/done/incremental-output hooks. The job runtime owns ids, cross-session isolation, completion notices, waiting, and disposal cleanup; this plugin only maps bash exit/sandbox facts into job output and outcome detail. `enableRunInBackground: false` removes the parameter and rejects a forced background call at execution time.
 
@@ -48,11 +48,11 @@ The tool owns its `presentCall`/`presentResult` render intent. A foreground call
 
 Commands run with the executor's full authority unless a sandboxing executor ([`dsh-bash-sandbox`](../bash-sandbox/)) confines them — the deny-only sandbox reports denials as result facts, rendered here as the denial marker; per-call allow/deny/ask policy is the `tools/pre-execute` waterfall (see docs/architecture.md).
 
-Escalating bash calls resolve `ctx.approval` before execution. `allowed-once` applies the requested mode only to that call; rejection, cancellation, unavailability, or missing approval context executes nothing and returns a distinct error. On a real denial, the model may retry the same command once in the same turn with the narrowest sufficient mode and justification; the approval prompt itself is the consent step. Escalation is never speculative, and a disabled or rejected approval is final. The [sandbox Agent Note](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) owns the rationale.
+Escalating bash calls resolve `ctx.approval` before execution. `allowed-once` applies the requested mode only to that call; rejection, cancellation, unavailability, or missing approval context executes nothing and returns a distinct error. On a real denial, the model may retry the same command once in the same turn with the narrowest sufficient mode and justification; the approval prompt itself is the consent step. A session under `never` or already at `danger-full-access` omits the escalation fields and retry guidance, and an injected request fails before execution with an instruction to retry without them. Escalation is never speculative, and a disabled or rejected approval is final. The [sandbox Agent Note](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) owns the rationale.
 
 ## Per-session mode switching
 
-For sandboxing executors, each call resolves mode as one-shot escalation, then session override, then executor default. Non-sandboxing and agent-less calls carry no session override. The policy owner contributes the current capability-neutral standing mode; denial results still own the operation-specific effective mode and retry guidance. See the [`dsh-shell` fold](../shell/README.md) and [sandbox switching contract](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md).
+For sandboxing executors, each call resolves mode as one-shot escalation, then session override, then executor default. Non-sandboxing and agent-less calls carry no session override. The policy owner contributes the current capability-neutral standing mode; denial results own the operation-specific effective mode and include retry guidance only when that call can ask for escalation. See the [`dsh-shell` fold](../shell/README.md) and [sandbox switching contract](../../../.agents/notes/implemented/feature/2026-07-06-sandbox.md).
 
 ## Model Experience
 
@@ -80,7 +80,7 @@ Prefix-stable while the registration scope and prompt text are unchanged. Plugin
 
 #### What the model sees
 
-The model sees the generated [`bash` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-bash). `run_in_background` appears only when this producer enables it; `sandbox_permissions` and `justification` appear only when the mounted executor advertises sandboxing. Agent-scoped tool restrictions can remove the definition for that agent.
+The model sees the generated [`bash` schema](../../../docs/tool-catalog.md#deepseek-aidsh-tool-bash). `run_in_background` appears only when this producer enables it. `sandbox_permissions`, `justification`, and their guidance appear only when the mounted executor sandboxes and the current session can ask for a wider mode. Agent-scoped tool restrictions can remove the definition for that agent.
 
 #### Token effect
 
@@ -88,13 +88,13 @@ Fixed schema cost on every request where the tools are visible; sandbox support 
 
 #### KV Cache effect
 
-Prefix-stable while visibility, background support, and executor sandbox capabilities are unchanged. A restriction, config change, or executor change may invalidate reuse from the first changed tool definition.
+Prefix-stable while visibility, background support, executor sandbox capabilities, and effective session permission state are unchanged. A restriction, config change, executor change, or permission switch that adds or removes escalation may invalidate reuse from the first changed tool definition.
 
 ### Foreground result
 
 #### What the model sees
 
-The renderer emits the data-dependent stdout tail, then optional `[stderr]` and the stderr tail. With no output it emits exactly `(no output)`. Conditional lines are exactly `[output truncated; full output: <path-or-(unavailable)>]`, `[sandbox: file access denied under <mode> mode]`, `[timed out after <timeoutMs>ms]`, `[killed by signal: <signal>]`, and `[exit code: <exitCode>]`; the sandbox escalation and runner-failure lines are quoted in [`dsh-bash-sandbox`](../bash-sandbox/README.md).
+The renderer emits the data-dependent stdout tail, then optional `[stderr]` and the stderr tail. With no output it emits exactly `(no output)`. Conditional lines are exactly `[output truncated; full output: <path-or-(unavailable)>]`, `[sandbox: file access denied under <mode> mode]`, `[timed out after <timeoutMs>ms]`, `[killed by signal: <signal>]`, and `[exit code: <exitCode>]`; the sandbox escalation line appears only when the calling session can ask, and the runner-failure line is quoted in [`dsh-bash-sandbox`](../bash-sandbox/README.md).
 
 #### Token effect
 
@@ -122,7 +122,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-Validation and policy failures are normalized as `Error: <message>`. This package's stable messages are `invalid command: expected a non-empty string`, `invalid description: expected a non-empty string`, `invalid timeoutMs: expected a positive number, got <value>`, `invalid escalation: sandbox_permissions requires a justification`, `invalid escalation: justification is only valid together with sandbox_permissions`, `invalid justification: expected a non-empty sentence`, `background execution is disabled for this bash tool`, `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`, `sandbox escalation to "<mode>" is not strictly wider than this call's current "<mode>" mode`, the approval-availability/rejection/cancellation variants, and `tool call aborted`.
+Validation and policy failures are normalized as `Error: <message>`. This package's stable messages are `invalid command: expected a non-empty string`, `invalid description: expected a non-empty string`, `invalid timeoutMs: expected a positive number, got <value>`, `invalid escalation: sandbox_permissions requires a justification`, `invalid escalation: justification is only valid together with sandbox_permissions`, `invalid justification: expected a non-empty sentence`, `background execution is disabled for this bash tool`, `background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs`, `sandbox_permissions is not available in this composition (no sandboxing executor to escalate)`, `sandbox escalation is disabled by this session approval policy; retry without sandbox_permissions and justification`, `sandbox escalation is unavailable because this call already has danger-full-access; retry without sandbox_permissions and justification`, `sandbox escalation to "<mode>" is not strictly wider than this call's current "<mode>" mode`, the approval-availability/rejection/cancellation variants, and `tool call aborted`.
 
 #### Token effect
 

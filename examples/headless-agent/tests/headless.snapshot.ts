@@ -118,6 +118,53 @@ function parseJsonl(content: string): JsonObject[] {
     .map(line => JSON.parse(line) as JsonObject)
 }
 
+/** Pin the permission-aware tool schemas recorded by one real product request. */
+function expectEscalationOmitted(content: string): void {
+  const requestHeader = parseJsonl(content).find(record => record.type === 'request/header')
+  const requestData = requestHeader?.data as JsonObject | undefined
+  const header = requestData?.header as JsonObject | undefined
+  const toolsValue = header?.tools
+  const tools = (typeof toolsValue === 'string' ? JSON.parse(toolsValue) : toolsValue) as Array<{
+    name: string
+    description: string
+    parameters: { properties?: Record<string, unknown> }
+  }>
+  if (!Array.isArray(tools)) throw new Error('the headless profile request did not record tool schemas')
+  const summarize = (name: string, aliases: readonly string[] = [name]) => {
+    const tool = tools.find(candidate => aliases.includes(candidate.name))
+    if (tool === undefined) throw new Error(`the headless profile request omitted ${name}`)
+    const properties = tool.parameters.properties ?? {}
+    return {
+      hasSandboxPermissions: Object.hasOwn(properties, 'sandbox_permissions'),
+      hasJustification: Object.hasOwn(properties, 'justification'),
+      mentionsEscalation: tool.description.includes('sandbox_permissions'),
+    }
+  }
+  expect({
+    shell: summarize('shell', ['bash', 'pwsh']),
+    write: summarize('write'),
+    edit: summarize('edit'),
+  }).toMatchInlineSnapshot(`
+    {
+      "edit": {
+        "hasJustification": false,
+        "hasSandboxPermissions": false,
+        "mentionsEscalation": false,
+      },
+      "shell": {
+        "hasJustification": false,
+        "hasSandboxPermissions": false,
+        "mentionsEscalation": false,
+      },
+      "write": {
+        "hasJustification": false,
+        "hasSandboxPermissions": false,
+        "mentionsEscalation": false,
+      },
+    }
+  `)
+}
+
 function contextFromLogs(contents: readonly string[]): NormalizeContext {
   const headers = contents.map(content => parseJsonl(content)[0])
   return {
@@ -263,10 +310,18 @@ describe('headless stream-json snapshots', () => {
       expectedExitCode: 1,
       env: {
         DSH_CLI_MOCK_FAILURE: '1',
+        DSH_PERMISSION_MODE: 'danger-full-access',
         DSH_TELEMETRY_DISABLED: '1',
         NODE_OPTIONS: [process.env.NODE_OPTIONS, '--disable-warning=ExperimentalWarning'].filter(Boolean).join(' '),
       },
       prepare: prepareCliMockFixture,
+      inspect: async (cwd) => {
+        const logs = await persistedLogs(cwd, join(cwd, '.dsh', 'sessions'))
+        expect(logs).toHaveLength(1)
+        const actual = logs[0]
+        if (actual === undefined) throw new Error('the headless profile did not persist its failed request')
+        expectEscalationOmitted(actual.content)
+      },
     })
 
     expect(result.stdout).toBe('\n')

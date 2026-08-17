@@ -13,17 +13,25 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
-import { ESCALATION_TARGETS, approveEscalation, escalationHintMarker, sandboxDenialMarker, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
+import {
+  ESCALATION_TARGETS,
+  approveEscalation,
+  escalationHintMarker,
+  sandboxDenialMarker,
+  validateEscalationArgs,
+  withoutEscalationSchema,
+} from '@deepseek-ai/dsh-sandbox'
+import type { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import { FsError } from '@deepseek-ai/dsh-fs'
 
-/** The two escalation arguments a mutating tool may carry (advertised only under a confining backend). */
+/** The two escalation arguments a mutating tool may carry when the assembled session can ask for escalation. */
 export interface FsEscalationArgs {
   sandbox_permissions?: string
   justification?: string
 }
 
-/** The schema fields for the escalation arguments, spread into a tool's `parameters` when a confining backend is mounted. */
+/** The registered escalation fields; prompt assembly removes them when the current session cannot ask. */
 export interface EscalationSchemaFields {
   sandbox_permissions: { type: 'string'; enum: string[]; description: string }
   justification: { type: 'string'; description: string }
@@ -35,7 +43,7 @@ export interface EscalationSchemaFields {
  * product of `ctx` at plugin apply time.
  */
 export class FsSandboxController {
-  /** The escalation targets this composition advertises (`[]` when no confining backend is mounted). */
+  /** The escalation targets supported by this composition (`[]` when no confining backend is mounted). */
   readonly escalationModes: readonly SandboxMode[]
   /** Shared per-session policy resolver, required by a confining backend. */
   private readonly policy: SandboxPolicyService | undefined
@@ -47,6 +55,30 @@ export class FsSandboxController {
     if (defaultMode !== undefined && this.policy === undefined) {
       throw new Error('tool-fs: the mounted filesystem confines but ctx.sandboxPolicy is missing')
     }
+    if (this.escalationModes.length > 0) {
+      ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+        const assembled = await next()
+        const agent = context.agent
+        if (agent === undefined) return assembled
+        const policy = this.policy?.resolve({ session: agent.session })
+        if (this.canEscalate(agent, policy)) return assembled
+        return {
+          ...assembled,
+          tools: assembled.tools.map(tool =>
+            tool.name === 'write' || tool.name === 'edit' ? withoutEscalationSchema(tool) : tool),
+        }
+      })
+    }
+  }
+
+  private canEscalate(
+    agent: ToolExecution['agent'],
+    policy: SandboxExecutionPolicy | undefined,
+  ): boolean {
+    if (this.escalationModes.length === 0 || agent === undefined || policy?.mode === 'danger-full-access') {
+      return false
+    }
+    return this.ctx.get('approval')?.effectivePolicy(agent.session) === 'ask'
   }
 
   /**
@@ -76,8 +108,8 @@ export class FsSandboxController {
    * The policy to stamp onto this mutation: an approved escalation grant (a
    * strictly wider retry resolved through `ctx.approval` before anything
    * executes), else the session's standing mode. The calling session's cwd is
-   * always carried as the workspace root. Validates the escalation argument
-   * pairing first.
+   * always carried as the workspace root. A session that cannot escalate gets
+   * a direct no-argument retry instruction before escalation-pair validation.
    * @param toolName - the mutating tool's name, for the approval audit trail.
    * @param args - the call's escalation arguments.
    * @param exec - the tool-execution context (agent, callId, signal).
@@ -85,8 +117,23 @@ export class FsSandboxController {
    *   unsandboxed backend.
    */
   async resolvePolicy(toolName: string, args: FsEscalationArgs, exec: ToolExecution): Promise<SandboxExecutionPolicy | undefined> {
-    validateEscalationArgs(args.sandbox_permissions, args.justification)
     const standingPolicy = this.policy?.resolve({ ...exec.agent ? { session: exec.agent.session } : {} })
+    if (args.sandbox_permissions !== undefined) {
+      const approval: ApprovalService | undefined = this.ctx.get('approval')
+      if (exec.agent !== undefined && approval?.effectivePolicy(exec.agent.session) === 'never') {
+        throw new Error(
+          'sandbox escalation is disabled by this session approval policy; '
+          + 'retry without sandbox_permissions and justification',
+        )
+      }
+      if (standingPolicy?.mode === 'danger-full-access') {
+        throw new Error(
+          'sandbox escalation is unavailable because this call already has danger-full-access; '
+          + 'retry without sandbox_permissions and justification',
+        )
+      }
+    }
+    validateEscalationArgs(args.sandbox_permissions, args.justification)
     if (args.sandbox_permissions === undefined || args.justification === undefined) {
       return standingPolicy
     }
@@ -110,22 +157,25 @@ export class FsSandboxController {
   /**
    * Map a thrown provider error for the model: a `FS_SANDBOX_DENIED` becomes a
    * `FsError` whose text is the shared `[sandbox: …]` denial marker plus the
-   * same-turn escalation hint, so a policy denial reads identically to bash's
-   * WHILE keeping the structured `FS_SANDBOX_DENIED` code — `ToolRuntime`
+   * same-turn escalation hint when this session can ask, so a policy denial
+   * reads identically to bash's while keeping the structured
+   * `FS_SANDBOX_DENIED` code. `ToolRuntime`
    * populates `result.error` only for `HarnessError` instances, so a plain
    * `Error` would strip the code retry/observers key off. Any other error
    * passes through unchanged. A `FS_SANDBOX_DENIED` only arises under a
-   * confining backend, which always advertises the escalation fields, so the
-   * hint always applies here.
+   * confining backend; the marker always applies, while the hint follows the
+   * current session policy.
    * @param error - the error thrown by the mutation.
    * @param policy - the policy stamped onto the call (names the mode in the marker).
+   * @param exec - the calling execution whose approval policy controls the hint.
    * @returns the error to throw — the marker `FsError` for a sandbox denial, else the original.
    */
-  mapError(error: unknown, policy: SandboxExecutionPolicy | undefined): unknown {
+  mapError(error: unknown, policy: SandboxExecutionPolicy | undefined, exec: ToolExecution): unknown {
     if (!(error instanceof FsError) || error.code !== 'FS_SANDBOX_DENIED') return error
     // A FS_SANDBOX_DENIED only arises under a confining backend, whose tool
     // path always resolves a policy before mutation.
     const mode = (policy as SandboxExecutionPolicy).mode
-    return new FsError(`${sandboxDenialMarker(mode)}\n${escalationHintMarker('operation')}`, 'FS_SANDBOX_DENIED', { cause: error })
+    const hint = this.canEscalate(exec.agent, policy) ? `\n${escalationHintMarker('operation')}` : ''
+    return new FsError(`${sandboxDenialMarker(mode)}${hint}`, 'FS_SANDBOX_DENIED', { cause: error })
   }
 }

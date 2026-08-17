@@ -70,9 +70,8 @@ export function apply(ctx: Context, config: Config): void {
   ctx.inject(['attachments'], (imageCtx) => {
     applyReadImageTool(imageCtx)
   })
-  // One escalation API shared by both mutating tools: advertisement gating,
-  // per-call policy resolution, and denial-marker mapping, all keyed off whether
-  // the mounted ctx.fs confines (ctx.fs.sandboxMode).
+  // One escalation API shared by both mutating tools: session-aware schema
+  // visibility, per-call policy resolution, and denial-marker mapping.
   const sandbox = new FsSandboxController(ctx)
   applyWriteTool(ctx, sandbox)
   applyEditTool(ctx, sandbox)

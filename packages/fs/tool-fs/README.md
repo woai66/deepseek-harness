@@ -51,7 +51,7 @@ The tools do **not** inject a policy service or inspect any cache. Each tool res
 
 The tool passes `exec` (the tool-execution context) as the opaque `actor` on every dispatch. The default thunks return `undefined` (the unconstrained bare provider). When `@deepseek-ai/dsh-fs-observation-policy` is loaded it occupies the single decision slot — returning `createIfAbsent`/`replaceIfVersion`/`{ version }` or throwing `FS_NOT_OBSERVED` — and records on `fs/observed`. Backend errors (`FsError`) and a thrown `FS_NOT_OBSERVED` flow through `ToolRuntime.execute()` and become `isError` tool results with their `{ name, code }` attached.
 
-When `ctx.fs.sandboxMode` reports confinement, write/edit advertise `sandbox_permissions` and `justification` and resolve approved retries through `ctx.approval`. The policy owner contributes capability-neutral standing policy; the tool results retain operation-specific denial and retry guidance.
+When `ctx.fs.sandboxMode` reports confinement, write/edit resolve approved retries through `ctx.approval`. Their `sandbox_permissions` and `justification` fields, description guidance, and denial-result retry hint appear only when the current session is below `danger-full-access` and its effective approval policy is `ask`. The policy owner contributes capability-neutral standing policy; injected escalation under `never` or full access fails before mutation with an instruction to retry without those fields.
 
 ## `fs/observed` is fire-and-forget
 
@@ -99,7 +99,7 @@ Prefix-stable while the plugin scope and guidance text are unchanged. Tool restr
 
 #### What the model sees
 
-The model sees the generated [`read`, `read_image`, `write`, and `edit` schemas](../../../docs/tool-catalog.md#deepseek-aidsh-tool-fs), with snake_case arguments. `read_image` appears only while a durable attachment store is mounted; the schema itself is route-independent, and the strict gate refuses at execution. Scoped tool restrictions can remove any definition for one agent.
+The model sees the generated [`read`, `read_image`, `write`, and `edit` schemas](../../../docs/tool-catalog.md#deepseek-aidsh-tool-fs), with snake_case arguments. `read_image` appears only while a durable attachment store is mounted; the schema itself is route-independent, and the strict gate refuses at execution. `write` and `edit` include escalation fields only when the current session can ask for a wider sandbox mode. Scoped tool restrictions can remove any definition for one agent.
 
 #### Token effect
 
@@ -107,7 +107,7 @@ Fixed schema cost on every request in that tool view.
 
 #### KV Cache effect
 
-Prefix-stable while the visible tool definitions and order are unchanged. Registration lifecycle or scoped restrictions may invalidate reuse from the first changed schema token.
+Prefix-stable while the visible tool definitions, order, and effective session permission state are unchanged. Registration lifecycle, scoped restrictions, or a permission switch that adds or removes escalation may invalidate reuse from the first changed schema token.
 
 ### Read result
 
@@ -155,7 +155,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 
 #### What the model sees
 
-Failures are normalized as `Error: <message>`. This package's stable validation and read messages are `file_path must be a non-empty string`, `limit must be less than or equal to <max>`, `old_string must be a non-empty string`, `old_string and new_string must differ`, `cannot read "<path>": not found`, `cannot read "<path>": not a regular file`, `offset <offset> is out of range for "<path>" (<total> lines)`, `cannot read "<path>": read_image only accepts PNG/JPEG/WebP/GIF paths`, `cannot read "<path>" as an image: model "<model>" does not declare image input; switch to an image-capable model to read images`, and the mismatch repair `cannot read "<path>": the <ext> extension declares <type>, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`; provider and policy templates are quoted in their package READMEs. Guarded-mutation failures additionally carry their recovery instruction in the message, appended by this package's model-facing error wrapper: `FS_STALE_VERSION` gets `— re-read the file, then retry`, and `FS_NOT_OBSERVED` gets `— read the file, then retry`; the structured code is preserved. After that reread confirms absence, edit reports `FS_NOT_FOUND` instead of repeating a stale remedy, while write uses guarded creation.
+Failures are normalized as `Error: <message>`. This package's stable validation and read messages are `file_path must be a non-empty string`, `limit must be less than or equal to <max>`, `old_string must be a non-empty string`, `old_string and new_string must differ`, `cannot read "<path>": not found`, `cannot read "<path>": not a regular file`, `offset <offset> is out of range for "<path>" (<total> lines)`, `cannot read "<path>": read_image only accepts PNG/JPEG/WebP/GIF paths`, `cannot read "<path>" as an image: model "<model>" does not declare image input; switch to an image-capable model to read images`, and the mismatch repair `cannot read "<path>": the <ext> extension declares <type>, but the bytes use a different image format; rename the file to match its actual format if it is PNG/JPEG/WebP/GIF, or convert it to one of those formats`; provider and policy templates are quoted in their package READMEs. Unusable escalation reports `sandbox escalation is disabled by this session approval policy; retry without sandbox_permissions and justification` or `sandbox escalation is unavailable because this call already has danger-full-access; retry without sandbox_permissions and justification`. Guarded-mutation failures additionally carry their recovery instruction in the message, appended by this package's model-facing error wrapper: `FS_STALE_VERSION` gets `— re-read the file, then retry`, and `FS_NOT_OBSERVED` gets `— read the file, then retry`; the structured code is preserved. After that reread confirms absence, edit reports `FS_NOT_FOUND` instead of repeating a stale remedy, while write uses guarded creation.
 
 #### Token effect
 

@@ -29,9 +29,14 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-jobs'
 import type {} from '@deepseek-ai/dsh-shell-env'
-import type {} from '@deepseek-ai/dsh-user-approval'
+import type { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
-import { ESCALATION_TARGETS, approveEscalation, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
+import {
+  ESCALATION_TARGETS,
+  approveEscalation,
+  validateEscalationArgs,
+  withoutEscalationSchema,
+} from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { parseExitStatus } from '@deepseek-ai/dsh-shell'
@@ -80,7 +85,13 @@ interface PwshForegroundResult {
   timeoutMs: number
   stdout: { text: string; truncated: boolean; spillPath?: string }
   stderr: { text: string; truncated: boolean; spillPath?: string }
-  sandbox?: { mode: string; denied: boolean; enforcement?: string; runnerFailed?: boolean }
+  sandbox?: {
+    mode: string
+    denied: boolean
+    escalationAvailable: boolean
+    enforcement?: string
+    runnerFailed?: boolean
+  }
 }
 
 /* jscpd:ignore-start -- minimal mirror of dsh-tool-bash's validation and execute plumbing (Agent Note). */
@@ -94,9 +105,6 @@ function validatePwshArgs(args: PwshToolArgs): void {
   if (args.timeoutMs !== undefined && (!Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0)) {
     throw new Error(`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`)
   }
-  // The escalation pairing (sandbox_permissions ⇔ justification, non-empty) is
-  // the shared rule both enforcing families validate identically.
-  validateEscalationArgs(args.sandbox_permissions, args.justification)
 }
 /* jscpd:ignore-end */
 
@@ -158,7 +166,7 @@ function resolveWorkdir(modelWorkdir: string | undefined, exec: { agent?: Agent 
 }
 
 /** Detach the executor DTO from readonly Service Definition types into plain JSON data. */
-function canonicalPwshResult(result: ShellRunResult): PwshForegroundResult {
+function canonicalPwshResult(result: ShellRunResult, escalationAvailable: boolean): PwshForegroundResult {
   const output = (stream: ShellRunResult['stdout']) => ({
     text: stream.text,
     truncated: stream.truncated,
@@ -178,6 +186,7 @@ function canonicalPwshResult(result: ShellRunResult): PwshForegroundResult {
       sandbox: {
         mode: result.sandbox.mode,
         denied: result.sandbox.denied,
+        escalationAvailable,
         ...result.sandbox.enforcement !== undefined ? { enforcement: result.sandbox.enforcement } : {},
         ...result.sandbox.runnerFailed !== undefined ? { runnerFailed: result.sandbox.runnerFailed } : {},
       },
@@ -200,6 +209,25 @@ export function apply(ctx: Context, config: Config = {}): void {
   const sandboxPolicy: SandboxPolicyService | undefined = defaultMode === undefined ? undefined : ctx.get('sandboxPolicy')
   if (defaultMode !== undefined && sandboxPolicy === undefined) {
     throw new Error('tool-pwsh: the mounted bash executor confines but ctx.sandboxPolicy is missing')
+  }
+  const canEscalate = (agent: Agent | undefined, policy: SandboxExecutionPolicy | undefined): boolean => {
+    if (escalationModes.length === 0 || agent === undefined || policy?.mode === 'danger-full-access') return false
+    return ctx.get('approval')?.effectivePolicy(agent.session) === 'ask'
+  }
+  if (escalationModes.length > 0) {
+    ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+      const assembled = await next()
+      const agent = context.agent
+      if (agent === undefined) return assembled
+      const policy = sandboxPolicy?.resolve({ session: agent.session })
+      if (canEscalate(agent, policy)) return assembled
+      return {
+        ...assembled,
+        tools: assembled.tools.map(tool => tool.name === 'pwsh'
+          ? withoutEscalationSchema(tool, pwshDescription(backgroundEnabled, []))
+          : tool),
+      }
+    })
   }
   /* jscpd:ignore-end */
   /** Resolve the complete standing policy for this call when a confining executor is mounted. */
@@ -229,10 +257,14 @@ export function apply(ctx: Context, config: Config = {}): void {
       throw new Error('sandbox_permissions is not available in this composition (no sandboxing executor to escalate)')
     }
     const effectiveMode = (standingPolicy as SandboxExecutionPolicy).mode
+    const approval: ApprovalService | undefined = ctx.get('approval')
+    if (exec.agent !== undefined && approval?.effectivePolicy(exec.agent.session) === 'never') {
+      throw new Error('sandbox escalation is disabled by this session approval policy; retry without sandbox_permissions and justification')
+    }
     return approveEscalation(
       { requestedMode: mode, justification, effectiveMode, subject: 'command' },
       {
-        approver: ctx.get('approval'),
+        approver: approval,
         agent: exec.agent,
         callId: exec.callId,
         toolName: 'pwsh',
@@ -328,6 +360,7 @@ export function apply(ctx: Context, config: Config = {}): void {
                 properties: {
                   mode: { type: 'string', required: true },
                   denied: { type: 'boolean', required: true },
+                  escalationAvailable: { type: 'boolean', required: true },
                   enforcement: { type: 'string' },
                   runnerFailed: { type: 'boolean' },
                 },
@@ -341,7 +374,10 @@ export function apply(ctx: Context, config: Config = {}): void {
         type: 'text',
         text: value.kind === 'background'
           ? `started background job ${value.jobId}`
-          : renderPwshResult(value as RenderablePwshResult, escalationModes),
+          : renderPwshResult(
+            value as RenderablePwshResult,
+            value.sandbox?.escalationAvailable ? escalationModes : [],
+          ),
       }],
     },
     /* jscpd:ignore-start -- the execute path mirrors dsh-tool-bash's by design (see the pwsh-tool-and-executor Agent Note). */
@@ -349,6 +385,23 @@ export function apply(ctx: Context, config: Config = {}): void {
       validatePwshArgs(args)
       // Description is display metadata; workdir defaults to the caller's session.
       const standingPolicy = resolveSandboxPolicy(exec)
+      if (args.sandbox_permissions !== undefined) {
+        const approval: ApprovalService | undefined = ctx.get('approval')
+        if (exec.agent !== undefined && approval?.effectivePolicy(exec.agent.session) === 'never') {
+          throw new Error(
+            'sandbox escalation is disabled by this session approval policy; '
+            + 'retry without sandbox_permissions and justification',
+          )
+        }
+        if (standingPolicy?.mode === 'danger-full-access') {
+          throw new Error(
+            'sandbox escalation is unavailable because this call already has danger-full-access; '
+            + 'retry without sandbox_permissions and justification',
+          )
+        }
+      }
+      validateEscalationArgs(args.sandbox_permissions, args.justification)
+      const escalationAvailable = canEscalate(exec.agent, standingPolicy)
       const approvedMode = args.sandbox_permissions !== undefined && args.justification !== undefined
         ? await approvePwshEscalation(args.sandbox_permissions, args.justification, exec, standingPolicy)
         : undefined
@@ -388,7 +441,11 @@ export function apply(ctx: Context, config: Config = {}): void {
             return {
               cancel: () => void proc.kill(),
               done: proc.done.then(() => processOutcome(proc)),
-              readOutput: () => renderPwshProcessRead(proc.readOutput(), proc.sandbox, escalationModes),
+              readOutput: () => renderPwshProcessRead(
+                proc.readOutput(),
+                proc.sandbox,
+                escalationAvailable ? escalationModes : [],
+              ),
             }
           },
         })
@@ -403,7 +460,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         error.name = 'AbortError'
         throw error
       }
-      return canonicalPwshResult(result)
+      return canonicalPwshResult(result, escalationAvailable)
     },
     /* jscpd:ignore-end */
     /* jscpd:ignore-start -- the background call card mirrors presentBashCall's by design (Agent Note). */
